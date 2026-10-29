@@ -251,6 +251,19 @@ def respaldar(ruta_db, carpeta="", dias=30, manual=False):
     return destino
 
 
+# Listas editables (nombre interno, nombre en pantalla)
+NOMBRES_LISTAS = [("operarios", "Operarios"), ("sectores", "Sectores"), ("maquinas", "Máquinas por sector"),
+                  ("estado", "Estados"), ("prioridad", "Prioridades"), ("planificado", "¿Fue planificado?"),
+                  ("extras", "Extras / Dev"), ("maq_parada", "¿Máq. parada?"), ("tipo_pcpg", "Tipo (PCPG)"),
+                  ("supervisores", "Supervisores")]
+# Valores que el programa usa en reglas: se avisa antes de renombrarlos o eliminarlos
+VALORES_CON_USO = {
+    ("estado", "EP_FM"): "la validación que exige el n° de SRH en REPUESTOS",
+    ("extras", "EXTRA"): "el color rojo en la lista",
+    ("extras", "DEV"): "el color azul en la lista",
+}
+
+
 def marca_modificacion():
     return f"{EQUIPO} {datetime.now():%d-%m-%Y %H:%M}"
 
@@ -299,15 +312,38 @@ class BaseDatos:
         return [f"c{i + 1:02d}" for i in range(len(self.encabezados))]
 
     # ---------- Importación ----------
-    def importar_excel(self, ruta_excel):
+    def importar_excel(self, ruta_excel, listas=True):
         wb = load_workbook(ruta_excel, read_only=True, data_only=True)  # el Excel nunca se guarda
         try:
             n = self._importar_bbdd(wb[HOJA_BBDD])
-            self._importar_listas(wb[HOJA_DATOS])
+            if listas:
+                self._importar_listas(wb[HOJA_DATOS])
         finally:
             wb.close()
         self.con.commit()
         return n
+
+    # ---------- Listas (hoja Datos) ----------
+    def listas_todas(self):
+        """{(lista, padre): [valores en orden]}. Las máquinas usan padre = sector."""
+        res = {}
+        for lista, valor, padre in self.con.execute("SELECT lista, valor, padre FROM listas ORDER BY lista, padre, orden"):
+            vals = res.setdefault((lista, padre), [])
+            if valor not in vals:
+                vals.append(valor)
+        return res
+
+    def guardar_listas(self, listas):
+        self.con.execute("BEGIN IMMEDIATE")
+        try:
+            self.con.execute("DELETE FROM listas")
+            self.con.executemany("INSERT INTO listas VALUES (?, ?, ?, ?)",
+                                 [(lista, i, v, padre) for (lista, padre), vals in listas.items()
+                                  for i, v in enumerate(vals)])
+            self.con.commit()
+        except Exception:
+            self.con.rollback()
+            raise
 
     def _importar_bbdd(self, ws):
         filas = ws.iter_rows(values_only=True)
@@ -482,6 +518,225 @@ def iniciar_interfaz():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, simpledialog
 
+    class EditorListas(tk.Toplevel):
+        """Edición de las listas de la hoja Datos (solo supervisor). Los cambios se aplican al presionar GUARDAR."""
+
+        def __init__(self, app):
+            super().__init__(app)
+            self.app = app
+            self.title("Editar listas")
+            self.geometry("720x480")
+            self.transient(app)
+            self.grab_set()
+            self.listas = app.db.listas_todas()
+            self.renombres = []   # (lista, viejo, nuevo) para informar
+            self.modificado = False
+
+            izq = ttk.Frame(self, padding=8)
+            izq.pack(side="left", fill="y")
+            ttk.Label(izq, text="Lista").pack(anchor="w")
+            self.lb_listas = tk.Listbox(izq, width=22, height=12, exportselection=False)
+            for _, nombre in NOMBRES_LISTAS:
+                self.lb_listas.insert("end", nombre)
+            self.lb_listas.pack(fill="y", expand=True)
+            self.lb_listas.bind("<<ListboxSelect>>", lambda e: self._cambiar_lista())
+
+            centro = ttk.Frame(self, padding=8)
+            centro.pack(side="left", fill="both", expand=True)
+            self.frm_sector = ttk.Frame(centro)
+            ttk.Label(self.frm_sector, text="Sector:").pack(side="left")
+            self.cmb_sec = ttk.Combobox(self.frm_sector, state="readonly", width=15)
+            self.cmb_sec.pack(side="left", padx=4)
+            self.cmb_sec.bind("<<ComboboxSelected>>", lambda e: self._mostrar_valores())
+            self.lbl_vals = ttk.Label(centro, text="Valores (en el orden en que aparecen en el desplegable)")
+            self.lbl_vals.pack(anchor="w")
+            self.lb_valores = tk.Listbox(centro, exportselection=False)
+            self.lb_valores.pack(fill="both", expand=True)
+            self.lb_valores.bind("<<ListboxSelect>>", lambda e: self._al_elegir_valor())
+
+            der = ttk.Frame(self, padding=8)
+            der.pack(side="left", fill="y")
+            ttk.Label(der, text="Valor").pack(anchor="w")
+            self.txt = ttk.Entry(der, width=22)
+            self.txt.pack(pady=(0, 8))
+            self.txt.bind("<Return>", lambda e: self.agregar())
+            for texto, cmd in [("Agregar", self.agregar), ("Renombrar", self.renombrar),
+                               ("Eliminar", self.eliminar), ("▲ Subir", lambda: self.mover(-1)),
+                               ("▼ Bajar", lambda: self.mover(1))]:
+                ttk.Button(der, text=texto, width=18, command=cmd).pack(pady=2)
+            ttk.Separator(der).pack(fill="x", pady=10)
+            ttk.Button(der, text="GUARDAR", width=18, command=self.guardar).pack(pady=2)
+            ttk.Button(der, text="Cancelar", width=18, command=self.cerrar).pack(pady=2)
+            self.lbl_nota = ttk.Label(der, text="", wraplength=160, foreground="gray")
+            self.lbl_nota.pack(pady=8)
+            self.protocol("WM_DELETE_WINDOW", self.cerrar)
+
+            self.lb_listas.selection_set(0)
+            self._cambiar_lista()
+
+        # ----- navegación -----
+        def _lista_actual(self):
+            return NOMBRES_LISTAS[self.lb_listas.curselection()[0]][0]
+
+        def _clave(self):
+            lista = self._lista_actual()
+            if lista == "maquinas":
+                return ("maquinas", self.cmb_sec.get()) if self.cmb_sec.get() else None
+            return (lista, None)
+
+        def _valores(self):
+            clave = self._clave()
+            return self.listas.setdefault(clave, []) if clave else []
+
+        def _cambiar_lista(self):
+            if not self.lb_listas.curselection():
+                return
+            if self._lista_actual() == "maquinas":
+                sectores = self.listas.get(("sectores", None), [])
+                self.cmb_sec["values"] = sectores
+                if self.cmb_sec.get() not in sectores:
+                    self.cmb_sec.set(sectores[0] if sectores else "")
+                self.frm_sector.pack(anchor="w", pady=(0, 6), before=self.lbl_vals)
+            else:
+                self.frm_sector.pack_forget()
+            notas = {"operarios": "Las 2 primeras letras forman el código de OT.",
+                     "sectores": "Al renombrar un sector se mantienen sus máquinas.",
+                     "estado": "EP_FM exige n° de SRH en REPUESTOS.",
+                     "extras": "EXTRA = rojo, DEV = azul en la lista."}
+            self.lbl_nota.config(text=notas.get(self._lista_actual(), ""))
+            self._mostrar_valores()
+
+        def _mostrar_valores(self, seleccionar=None):
+            self.lb_valores.delete(0, "end")
+            for v in self._valores():
+                self.lb_valores.insert("end", v)
+            if seleccionar is not None and 0 <= seleccionar < self.lb_valores.size():
+                self.lb_valores.selection_set(seleccionar)
+                self.lb_valores.see(seleccionar)
+            self.txt.delete(0, "end")
+
+        def _al_elegir_valor(self):
+            i = self._indice()
+            if i is not None:
+                self.txt.delete(0, "end")
+                self.txt.insert(0, self._valores()[i])
+
+        def _indice(self):
+            s = self.lb_valores.curselection()
+            return s[0] if s else None
+
+        # ----- validaciones -----
+        def _validar_nuevo(self, valor, excepto=None):
+            if not valor:
+                messagebox.showwarning("Valor", "Escriba un valor.", parent=self)
+                return False
+            if not self._clave():
+                messagebox.showwarning("Máquinas", "Primero elija un sector.", parent=self)
+                return False
+            if any(v.upper() == valor.upper() for i, v in enumerate(self._valores()) if i != excepto):
+                messagebox.showwarning("Valor", f"'{valor}' ya está en la lista.", parent=self)
+                return False
+            if self._lista_actual() == "operarios":
+                if len(valor) < 2:
+                    messagebox.showwarning("Operario", "El nombre debe tener al menos 2 letras.", parent=self)
+                    return False
+                iguales = [v for i, v in enumerate(self._valores()) if i != excepto and v[:2].upper() == valor[:2].upper()]
+                if iguales and not messagebox.askyesno(
+                        "Código de OT compartido",
+                        f"'{valor}' comparte las 2 primeras letras ({valor[:2].upper()}) con: {', '.join(iguales)}.\n"
+                        "Sus OT tendrán el mismo código y BUSCAR mostrará las actividades de ambos.\n\n¿Continuar?",
+                        parent=self):
+                    return False
+            return True
+
+        def _confirmar_uso(self, valor, accion):
+            uso = VALORES_CON_USO.get((self._lista_actual(), valor))
+            return not uso or messagebox.askyesno(
+                "Valor usado por el programa",
+                f"'{valor}' se usa en {uso}.\nSi lo {accion}, esa función deja de aplicarse.\n\n¿Continuar?",
+                icon="warning", parent=self)
+
+        # ----- acciones -----
+        def agregar(self):
+            valor = self.txt.get().strip()
+            if not self._validar_nuevo(valor):
+                return
+            vals = self._valores()
+            vals.append(valor)
+            if self._lista_actual() == "sectores":
+                self.listas.setdefault(("maquinas", valor), [])
+            self.modificado = True
+            self._mostrar_valores(len(vals) - 1)
+
+        def renombrar(self):
+            i = self._indice()
+            if i is None:
+                messagebox.showinfo("Renombrar", "Seleccione el valor a renombrar.", parent=self)
+                return
+            vals = self._valores()
+            viejo, nuevo = vals[i], self.txt.get().strip()
+            if nuevo == viejo or not self._validar_nuevo(nuevo, excepto=i) or not self._confirmar_uso(viejo, "renombra"):
+                return
+            vals[i] = nuevo
+            if self._lista_actual() == "sectores" and ("maquinas", viejo) in self.listas:
+                self.listas[("maquinas", nuevo)] = self.listas.pop(("maquinas", viejo))
+            self.renombres.append((self._lista_actual(), viejo, nuevo))
+            self.modificado = True
+            self._mostrar_valores(i)
+
+        def eliminar(self):
+            i = self._indice()
+            if i is None:
+                messagebox.showinfo("Eliminar", "Seleccione el valor a eliminar.", parent=self)
+                return
+            vals = self._valores()
+            valor = vals[i]
+            if not self._confirmar_uso(valor, "elimina"):
+                return
+            if self._lista_actual() == "sectores":
+                maqs = self.listas.get(("maquinas", valor), [])
+                if not messagebox.askyesno("Eliminar sector",
+                                           f"¿Eliminar el sector '{valor}'"
+                                           + (f" y sus {len(maqs)} máquinas?" if maqs else "?"), parent=self):
+                    return
+                self.listas.pop(("maquinas", valor), None)
+            del vals[i]
+            self.modificado = True
+            self._mostrar_valores(min(i, len(vals) - 1))
+
+        def mover(self, delta):
+            i = self._indice()
+            vals = self._valores()
+            if i is None or not 0 <= i + delta < len(vals):
+                return
+            vals[i], vals[i + delta] = vals[i + delta], vals[i]
+            self.modificado = True
+            self._mostrar_valores(i + delta)
+
+        def guardar(self):
+            if not self.modificado:
+                self.destroy()
+                return
+            limpio = {k: v for k, v in self.listas.items() if v}
+            try:
+                self.app.db.guardar_listas(limpio)
+            except sqlite3.Error as ex:
+                messagebox.showerror("Error", f"No se pudieron guardar las listas:\n{ex}", parent=self)
+                return
+            self.app._cargar_combos()
+            msg = "Listas guardadas."
+            if self.renombres:
+                msg += ("\n\nLas actividades ya cargadas conservan el nombre anterior:\n"
+                        + "\n".join(f"  {v} → {n}" for _, v, n in self.renombres[:8]))
+            messagebox.showinfo("Editar listas", msg, parent=self)
+            self.destroy()
+
+        def cerrar(self):
+            if self.modificado and not messagebox.askyesno("Editar listas", "Hay cambios sin guardar. ¿Descartarlos?",
+                                                           parent=self):
+                return
+            self.destroy()
+
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
@@ -571,6 +826,8 @@ def iniciar_interfaz():
                 dv = self.db.data_version()
                 if dv != self.dv:
                     self.dv = dv
+                    if not self.db.vacia:
+                        self._cargar_combos()   # por si otro supervisor editó las listas
                     if self.consulta and len(self.filas_lista) <= LIMITE_REFRESCO_AUTO:
                         self.refrescar()
                     elif self.consulta:
@@ -618,6 +875,8 @@ def iniciar_interfaz():
             archivo.add_command(label="Refrescar lista (F5)", command=self.refrescar)
             archivo.add_command(label="Respaldar ahora", command=self.respaldar_ahora)
             archivo.add_command(label="Ubicación de la base...", command=self.cambiar_ubicacion)
+            archivo.add_separator()
+            archivo.add_command(label="Editar listas (supervisor)...", command=self.editar_listas)
             archivo.add_separator()
             archivo.add_command(label="Salir", command=self.destroy)
             menu.add_cascade(label="Archivo", menu=archivo)
@@ -848,7 +1107,8 @@ def iniciar_interfaz():
             if limpiar:
                 cmb_maq.set("")
 
-        def _cargar_listas(self):
+        def _cargar_combos(self):
+            """Carga las listas desplegables desde la base (se llama también cuando otra PC las edita)."""
             self.cmb_oper["values"] = self.db.lista("operarios")
             sectores = self.db.lista("sectores")
             self.cmb_sector["values"] = sectores
@@ -857,6 +1117,19 @@ def iniciar_interfaz():
                                  (TIPO_END, "extras"), (MAQ_PAR, "maq_parada"), (TIPO_PCPG, "tipo_pcpg")]:
                 self.campos[clave]["values"] = [""] + self.db.lista(lista)
             self.cmb_control["values"] = [""] + self.db.lista("supervisores")
+            if self.cmb_sector.get():
+                self.cmb_maquina["values"] = self.db.lista("maquinas", self.cmb_sector.get())
+
+        def editar_listas(self):
+            if not self.supervisor:
+                messagebox.showwarning("Editar listas", "Solo un supervisor puede editar las listas.")
+                return
+            if self.db.vacia:
+                return
+            EditorListas(self)
+
+        def _cargar_listas(self):
+            self._cargar_combos()
             # Columnas de la lista: las 31 de bbdd
             cols = self.db.encabezados
             self.tree["columns"] = cols
@@ -1156,6 +1429,9 @@ def iniciar_interfaz():
                                     "Asegúrese de que nadie más esté usando el programa en otra PC.\n"
                                     "Antes de importar se crea un respaldo.\n\n¿Continuar?", icon="warning"):
                     return
+            con_listas = self.db.vacia or messagebox.askyesno(
+                "Listas", f"¿Reemplazar también las listas (operarios, sectores, máquinas, etc.) por las de la "
+                          f"hoja '{HOJA_DATOS}'?\n\nNo = conservar las listas editadas en el programa.")
             ruta = filedialog.askopenfilename(title="Seleccionar CargaActividades",
                                               filetypes=[("Excel", "*.xlsm *.xlsx")])
             if not ruta:
@@ -1165,7 +1441,7 @@ def iniciar_interfaz():
             try:
                 if not self.db.vacia:
                     respaldar(self.db.ruta, self.cfg.get("respaldo", "carpeta"), manual=True)
-                n = self.db.importar_excel(ruta)
+                n = self.db.importar_excel(ruta, listas=con_listas)
             except KeyError as ex:
                 messagebox.showerror("Error", f"El archivo no tiene la hoja {ex}.")
                 return
@@ -1176,7 +1452,8 @@ def iniciar_interfaz():
                 self.config(cursor="")
             self._cargar_listas()
             self.limpiar()
-            messagebox.showinfo("Importación", f"Se importaron {n} registros y las listas de '{HOJA_DATOS}'.")
+            messagebox.showinfo("Importación", f"Se importaron {n} registros"
+                                               + (f" y las listas de '{HOJA_DATOS}'." if con_listas else "."))
 
         def exportar(self, completa):
             if self.db.vacia:
